@@ -1,12 +1,19 @@
 use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::sync::Arc;
-use skia_safe::{gpu, ImageInfo, ISize, Surface};
+
+use glutin::api::egl::device::Device;
+use glutin::api::egl::display::Display;
+use glutin::config::{ConfigSurfaceTypes, ConfigTemplate, ConfigTemplateBuilder, GlConfig};
+use glutin::context::{ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentGlContext};
+use glutin::display::{GetGlDisplay, GlDisplay};
+use skia_safe::{ColorType, gpu, ImageInfo, ISize, Surface};
+use skia_safe::gpu::gl::FramebufferInfo;
+use skia_safe::gpu::SurfaceOrigin;
 use softbuffer::SoftBufferError;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
-
-use offscreen_gl_context::{GLContext, GLVersion, NativeGLContext, sparkle};
+use crate::impl_window_wrapper;
 
 pub struct WindowWrapper {
     skia_context: gpu::DirectContext,
@@ -18,16 +25,68 @@ pub struct WindowWrapper {
 
 impl WindowWrapper {
     pub fn wrap(window: Window) -> Self {
-        let gl_context = GLContext::<NativeGLContext>::create(
-            sparkle::gl::GlType::Gl,
-            GLVersion::MajorMinor(3, 3),
-            None,
-        )
-            .unwrap();
+        let devices = Device::query_devices().expect("Failed to query devices").collect::<Vec<_>>();
 
-        gl_context.make_current().unwrap();
+        for (index, device) in devices.iter().enumerate() {
+            println!(
+                "Device {}: Name: {} Vendor: {}",
+                index,
+                device.name().unwrap_or("UNKNOWN"),
+                device.vendor().unwrap_or("UNKNOWN")
+            );
+        }
 
-        let interface = gpu::gl::Interface::new_native().unwrap();
+        let device = devices.first().expect("No available devices");
+
+        // Create a display using the device.
+        let display =
+            unsafe { Display::with_device(device, None) }.expect("Failed to create display");
+
+        let template = config_template();
+        let config = unsafe { display.find_configs(template) }
+            .unwrap()
+            .reduce(
+                |config, acc| {
+                    if config.num_samples() > acc.num_samples() {
+                        config
+                    } else {
+                        acc
+                    }
+                },
+            )
+            .expect("No available configs");
+
+        println!("Picked a config with {} samples", config.num_samples());
+
+        // Context creation.
+        //
+        // In particular, since we are doing offscreen rendering we have no raw window
+        // handle to provide.
+        let context_attributes = ContextAttributesBuilder::new().build(None);
+
+        // Since glutin by default tries to create OpenGL core context, which may not be
+        // present we should try gles.
+        let fallback_context_attributes =
+            ContextAttributesBuilder::new().with_context_api(ContextApi::OpenGl(None)).build(None);
+
+        let not_current = unsafe {
+            display.create_context(&config, &context_attributes).unwrap_or_else(|_| {
+                display
+                    .create_context(&config, &fallback_context_attributes)
+                    .expect("failed to create context")
+            })
+        };
+
+        // Make the context current for rendering
+        let context = not_current.make_current_surfaceless().unwrap();
+        println!("Context created: {:?}", context.is_current());
+
+
+        let interface = gpu::gl::Interface::new_load_with_cstr(|name|{
+            context.display().get_proc_address(name)
+        }).unwrap();
+
+
 
         let window = Arc::new(window);
         let soft_buffer_context = softbuffer::Context::new(window.clone()).unwrap();
@@ -41,77 +100,30 @@ impl WindowWrapper {
         }
     }
 
-    pub fn resize(&mut self, size: impl Into<PhysicalSize<u32>>) -> Result<(), SoftBufferError>{
-        let size = size.into();
-        let width = NonZeroU32::new(size.width).unwrap();
-        let height = NonZeroU32::new(size.height).unwrap();
-        let result=self.soft_buffer_surface.resize(width, height);
-        match result {
-            Ok(_) => {
-                let surface = self.create_surface(size);
-                self.skia_surface = Some(surface);
-                self.size = ISize::new(size.width as i32, size.height as i32);
-                Ok(())
-            }
-            Err(e) => {
-                return Err(e)
-            }
-        }
-    }
-
-    pub fn surface(&mut self) -> &mut Surface {
-        if let Some(surface) = &mut self.skia_surface {
-            surface
-        } else {
-            panic!("Surface not created. Please call resize first.");
-        }
-    }
-
     fn create_surface(&mut self, size: impl Into<PhysicalSize<u32>>) -> Surface {
         let size = size.into();
         let width = size.width;
         let height = size.height;
         let image_info = ImageInfo::new_n32_premul((width as i32, height as i32), None);
-        let mut surface = gpu::surfaces::render_target(
+        gpu::surfaces::render_target(
             &mut self.skia_context,
             gpu::Budgeted::Yes,
             &image_info,
             None,
-            gpu::SurfaceOrigin::TopLeft,
+            SurfaceOrigin::TopLeft,
             None,
             false,
             None,
-        )
-            .unwrap();
-        surface
-    }
-
-    pub fn present(&mut self){
-        if let Some(surface) = &mut self.skia_surface {
-            let mut soft_buffer = self.soft_buffer_surface.buffer_mut().unwrap();
-            let u8_slice = bytemuck::cast_slice_mut::<u32, u8>(&mut soft_buffer);
-            let image_info = ImageInfo::new_n32_premul((self.size.width, self.size.height), None);
-            surface.read_pixels(
-                &image_info,
-                u8_slice,
-                self.size.width as usize * 4,
-                (0, 0),
-            );
-            soft_buffer.present().unwrap();
-        }
+        ).unwrap()
     }
 }
 
-impl AsRef<Window> for WindowWrapper {
-    fn as_ref(&self) -> &Window {
-        self.soft_buffer_surface.window()
-    }
+fn config_template() -> ConfigTemplate {
+    ConfigTemplateBuilder::default()
+        .with_alpha_size(8)
+        // Offscreen rendering has no support window surface support.
+        .with_surface_type(ConfigSurfaceTypes::empty())
+        .build()
 }
 
-impl Deref for WindowWrapper {
-    type Target = Window;
-
-    fn deref(&self) -> &Self::Target {
-        self.soft_buffer_surface.window()
-    }
-}
+impl_window_wrapper!();
